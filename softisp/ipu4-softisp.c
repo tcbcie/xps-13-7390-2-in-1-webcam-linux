@@ -48,9 +48,11 @@
 #define PH (H + 2 * PAD)
 #define N_BUFS 8			/* ~130 ms of slack at 60 fps */
 #define BAD_FRAME_LIMIT 12
+#define OVEREXPOSED_RUN 2	/* invalid frames in a row before lowering exposure */
 #define MIN_ACC 2		/* sensor frames summed per output */
 #define MAX_ACC 4
 #define IDLE_MS 2000		/* keep streaming this long after last reader */
+#define IDLE_REFRESH_MS 1000	/* rewrite the black frame this often while idle */
 #define FRAME_TIMEOUT_MS 500	/* a stalled IPU stream; frames arrive every 17 ms */
 #define FIRST_FRAME_TIMEOUT_MS 1500
 #define MAX_RECOVERIES 3	/* consecutive failed sessions before exiting */
@@ -374,6 +376,22 @@ static void write_black(int out_fd)
 		perror("loopback write (black)");
 }
 
+/*
+ * v4l2loopback's default frame interval is the unreduced 10000/300000, and
+ * Chromium-based apps set it back to that when they capture. PipeWire 1.0
+ * does not match it against 30/1, so GStreamer apps that request a frame
+ * rate (Cheese) fail with "no more input formats". Advertise exactly 1/30.
+ */
+static void set_output_interval(int out_fd)
+{
+	struct v4l2_streamparm p = { .type = V4L2_BUF_TYPE_VIDEO_OUTPUT };
+
+	p.parm.output.timeperframe.numerator = 1;
+	p.parm.output.timeperframe.denominator = 30;
+	if (xioctl(out_fd, VIDIOC_S_PARM, &p) < 0)
+		perror("output S_PARM");
+}
+
 static double now_ms(void)
 {
 	struct timespec t;
@@ -453,6 +471,25 @@ static void ae_apply(int sd_fd, const struct ae *a)
 		fprintf(stderr, "set exposure %d: %s\n", a->expo, strerror(errno));
 	if (set_ctrl(sd_fd, V4L2_CID_ANALOGUE_GAIN, a->gain) < 0)
 		fprintf(stderr, "set gain %d: %s\n", a->gain, strerror(errno));
+}
+
+/*
+ * Halve the sensor exposure: analogue gain first, then exposure lines. The
+ * frame sum and software gain do not affect clipping in the sensor, so they
+ * return to their defaults. Used when frames arrive too clipped to meter.
+ */
+static void ae_darken(int sd_fd, struct ae *a)
+{
+	if (a->gain > GAIN_MIN)
+		a->gain = a->gain / 2 > GAIN_MIN ? a->gain / 2 : GAIN_MIN;
+	else
+		a->expo = a->expo / 2 > EXP_MIN ? a->expo / 2 : EXP_MIN;
+	a->dgain = 1024;
+	if (a->nacc != MIN_ACC) {
+		a->nacc = MIN_ACC;
+		build_lin_lut(MIN_ACC);
+	}
+	ae_apply(sd_fd, a);
 }
 
 struct buf {
@@ -627,7 +664,22 @@ static int stream_session(struct isp *s)
 		if (frame_invalid(raw_copy, &cut)) {
 			s->truncated += cut;
 			phase = 0;	/* drop the incomplete sum */
-			if (++bad_frames >= BAD_FRAME_LIMIT) {
+			/*
+			 * A fully clipped row packs to the same 0xff bytes as DMA
+			 * padding, so a scene far brighter than the current exposure
+			 * (daylight after a dark session, a bright light coming into
+			 * view) lands here, where auto exposure never sees it. After a
+			 * run of invalid frames, halve the sensor exposure on each one;
+			 * if the cause was a real truncation, auto exposure restores
+			 * it within a few frames. The reduction carries into a restart.
+			 */
+			if (++bad_frames >= OVEREXPOSED_RUN && !getenv("SOFTISP_NO_AE")) {
+				if (bad_frames == OVEREXPOSED_RUN)
+					fprintf(stderr,
+						"ipu4-softisp: invalid frames, possibly overexposed; lowering exposure\n");
+				ae_darken(s->sd_fd, &s->ae);
+			}
+			if (bad_frames >= BAD_FRAME_LIMIT) {
 				fprintf(stderr,
 					"ipu4-softisp: invalid padded frames; restarting stream\n");
 				goto out;
@@ -789,6 +841,7 @@ int main(int argc, char **argv)
 			return 1;
 		}
 	}
+	set_output_interval(s.out_fd);
 	{
 		struct v4l2_event_subscription sub = {
 			.type = V4L2_EVENT_PRI_CLIENT_USAGE,
@@ -842,12 +895,24 @@ int main(int argc, char **argv)
 		resume_req = 0;
 		if (s.readers <= 0) {
 			struct pollfd pfd = { .fd = s.out_fd, .events = POLLPRI };
+			int pr = poll(&pfd, 1, IDLE_REFRESH_MS);
 
-			if (poll(&pfd, 1, -1) < 0) {
+			if (pr < 0) {
 				if (errno == EINTR)
 					continue;
 				perror("poll");
 				return 1;
+			}
+			/*
+			 * A reader that starts streaming first receives the last frame
+			 * written, stamped with the time it was written. Players that
+			 * pace frames by timestamp (ffplay, guvcview) hold that frame
+			 * for the whole idle period before showing the next one, so
+			 * keep it recent.
+			 */
+			if (pr == 0) {
+				write_black(s.out_fd);
+				continue;
 			}
 			if (pfd.revents & POLLPRI)
 				s.readers = dq_readers(s.out_fd, s.readers);
@@ -870,7 +935,10 @@ int main(int argc, char **argv)
 			fprintf(stderr, "ipu4-softisp: restarting capture (attempt %d)\n",
 				failures + 1);
 		}
-		if (s.readers <= 0)
+		if (s.readers <= 0) {
+			/* undo the 10000/300000 a Chromium-based reader may have set */
+			set_output_interval(s.out_fd);
 			fprintf(stderr, "ipu4-softisp: no readers, sensor stopped\n");
+		}
 	}
 }
